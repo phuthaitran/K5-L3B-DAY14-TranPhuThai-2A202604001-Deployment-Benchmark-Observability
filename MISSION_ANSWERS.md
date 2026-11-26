@@ -28,14 +28,19 @@
 ## Part 2: Docker
 
 ### Exercise 2.1: Dockerfile questions
-1. Base image: [Your answer]
-2. Working directory: [Your answer]
-...
+1. **Base image:** `python:3.11`, the full Python distribution (about 1 GB). A base image is the starting filesystem a container image is built on, here a Debian OS with Python 3.11, pip and many build tools already installed. Every later instruction adds a layer on top of it. The full image is convenient but large; `python:3.11-slim` or a multi-stage build makes it much smaller.
+2. **Working directory:** `/app`. `WORKDIR /app` creates the directory if needed and makes it the current directory for every later `RUN`, `COPY`, `CMD` and `ENTRYPOINT`. That's why `COPY requirements.txt .` and `COPY app.py .` land in `/app`, and why `CMD ["python", "app.py"]` finds the file. It also keeps the app out of the root filesystem.
+3. **Why COPY requirements.txt first:** Docker caches each layer and rebuilds a layer only when its inputs change, along with every layer after it. Copying only `requirements.txt` and running `pip install` before copying the code means a change to `app.py` invalidates just the final `COPY` layer, and the slow dependency install comes from cache. If you copied all the code first, every code edit would reinstall all dependencies and builds would be much slower.
+4. **CMD vs ENTRYPOINT:**
+   - `CMD` sets the **default** command or arguments, and anything passed to `docker run` replaces it. For example, `docker run agent-develop bash` runs `bash` instead of `python app.py`.
+   - `ENTRYPOINT` sets the **fixed executable** that always runs. Arguments passed to `docker run` are appended to it instead of replacing it, and you can only change it with `--entrypoint`.
+   - Used together, `ENTRYPOINT` is the program and `CMD` gives its default arguments. For example, `ENTRYPOINT ["python", "app.py"]` with `CMD ["--port", "8000"]` runs `python app.py --port 8000` by default, and `docker run img --port 9000` overrides only the arguments.
+   - This Dockerfile uses only `CMD`, so the container runs `python app.py` by default but can easily be started with another command for debugging.
 
 ### Exercise 2.3: Image size comparison
-- Develop: [X] MB
-- Production: [Y] MB
-- Difference: [Z]%
+- Develop: 1699.84 MB
+- Production: 239.81 MB
+- Difference: 150.55%
 
 ## Part 3: Cloud Deployment
 
