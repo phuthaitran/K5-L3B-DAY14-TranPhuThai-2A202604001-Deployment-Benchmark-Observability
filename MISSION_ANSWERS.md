@@ -40,7 +40,75 @@
 ### Exercise 2.3: Image size comparison
 - Develop: 1699.84 MB
 - Production: 239.81 MB
-- Difference: 150.55%
+- Difference: production is 85.9% smaller than development
+
+### Exercise 2.4: Docker Compose stack
+
+**Architecture diagram**
+
+```
+                    Client (browser / curl)
+                              │
+                              │  HTTP :80 / HTTPS :443  (only ports published to host)
+                              ▼
+┌──────────────────────────── Docker host ─────────────────────────────┐
+│                                                                      │
+│   ┌──────────────────────── network: internal (bridge) ───────────┐  │
+│   │                                                               │  │
+│   │            ┌──────────────────────────────┐                   │  │
+│   │            │ nginx  (nginx:alpine)        │                   │  │
+│   │            │ reverse proxy/load balancer  │                   │  │
+│   │            └──────────────┬───────────────┘                   │  │
+│   │                           │ http://agent:8000                 │  │
+│   │                           ▼                                   │  │
+│   │            ┌──────────────────────────────┐                   │  │
+│   │            │ agent  (FastAPI, port 8000)  │                   │  │
+│   │            │ built from production        │                   │  │
+│   │            │ Dockerfile, target: runtime  │                   │  │
+│   │            │ healthcheck: GET /health     │                   │  │
+│   │            └───────┬──────────────┬───────┘                   │  │
+│   │   redis://redis:6379/0           http://qdrant:6333           │  │
+│   │                   ▼              ▼                            │  │
+│   │   ┌────────────────────┐   ┌──────────────────────────┐       │  │
+│   │   │ redis              │   │ qdrant                   │       │  │
+│   │   │ (redis:7-alpine)   │   │ (qdrant/qdrant:v1.9.0)   │       │  │
+│   │   │ session cache +    │   │ vector DB for RAG        │       │  │
+│   │   │ rate limiting      │   │                          │       │  │
+│   │   └─────────┬──────────┘   └────────────┬─────────────┘       │  │
+│   └─────────────┼───────────────────────────┼─────────────────────┘  │
+│                 ▼                           ▼                        │
+│        volume: redis_data           volume: qdrant_data              │
+│        (/data)                      (/qdrant/storage)                │
+└──────────────────────────────────────────────────────────────────────┘
+
+Startup order (depends_on):
+  redis (healthy) ─┐
+                   ├──► agent ──► nginx
+  qdrant (healthy)─┘
+```
+
+**Which services are started?**
+
+`docker compose up` starts 4 services:
+
+| Service | Image | Role | Exposed to host? |
+|---------|-------|------|------------------|
+| `agent` | Built from `02-docker/production/Dockerfile` (stage `runtime`) | FastAPI AI agent on port 8000. Config comes from env vars plus `.env.local` (secrets, kept out of git). `restart: unless-stopped` | No, reachable only through nginx |
+| `redis` | `redis:7-alpine` | Session cache and rate-limit counters, capped at 256 MB with LRU eviction, data kept in the `redis_data` volume | No |
+| `qdrant` | `qdrant/qdrant:v1.9.0` | Vector database for RAG, data kept in the `qdrant_data` volume | No |
+| `nginx` | `nginx:alpine` | Reverse proxy and load balancer, config mounted read-only from `./nginx/nginx.conf` | Yes, `80:80` and `443:443` |
+
+Compose starts them in dependency order. `redis` and `qdrant` start first, and `agent` waits until both pass their healthchecks (`condition: service_healthy`). `nginx` starts after `agent` has started (plain `depends_on`, so it does not wait for the agent to be healthy).
+
+**How do they communicate?**
+
+- **One private network:** all 4 services are on the `internal` bridge network. Docker's built-in DNS resolves each service name (`agent`, `redis`, `qdrant`) to its container IP, so services use names instead of hardcoded IPs.
+- **Client → nginx:** nginx is the only entry point, since only its ports 80 and 443 are published on the host. agent, redis and qdrant publish no ports, so they can't be reached from outside, which reduces the attack surface.
+- **nginx → agent:** nginx proxies requests to `http://agent:8000` (defined in `nginx.conf`). If the agent is scaled to several replicas (`docker compose up --scale agent=2`), Docker DNS returns all their IPs and nginx spreads the requests across them.
+- **agent → redis:** over the Redis protocol at `REDIS_URL=redis://redis:6379/0`, used for sessions and rate limiting.
+- **agent → qdrant:** over HTTP REST at `QDRANT_URL=http://qdrant:6333`, used for vector search.
+- **Healthchecks:** Docker checks each service from inside its container: the agent with `GET http://localhost:8000/health`, redis with `redis-cli ping`, and qdrant with a TCP connect to port 6333. These results control startup order, and `restart: unless-stopped` restarts the agent or nginx if its process exits.
+
 
 ## Part 3: Cloud Deployment
 
