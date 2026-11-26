@@ -118,11 +118,105 @@ Compose starts them in dependency order. `redis` and `qdrant` start first, and `
 
 ## Part 4: API Security
 
-### Exercise 4.1-4.3: Test results
-[Paste your test outputs]
+### Exercise 4.1: API key authentication
+- Without API key: `401 Unauthorized` `{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}`
+- With API key: `200 OK` `{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}`
+
+### Exercise 4.2: JWT Authentication 
+- Get JWT token: `200 OK` `{"access_token":"<token>","token_type":"bearer","expires_in_minutes":60,"hint":"Include in header: Authorization: Bearer <token>"}`
+- After insert JWT token: `200 OK` `{"question":"Explain JWT","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic.","usage":{"requests_remaining":8,"budget_remaining_usd":4e-05}}`
+
+### Exercise 4.3: Rate limiter
+- **Algorithm:** **Sliding window**, specifically a sliding window **log**, not a token bucket. Each user has a `deque` of request timestamps. On every request, timestamps older than `now - window_seconds` are removed from the front. If `max_requests` or more timestamps remain, the request is rejected with **429 Too Many Requests**, with `Retry-After` (computed from the oldest timestamp) and `X-RateLimit-*` headers. Otherwise the current timestamp is appended. Because the window moves with time instead of resetting at fixed minute boundaries, a user can't send 2× the limit by bursting at the edge of a window. A token bucket would instead refill tokens at a steady rate and allow bursts up to the bucket size.
+- **Limit:** `window_seconds=60`, so limits are per minute:
+   - Normal user (`rate_limiter_user`): **10 requests/minute**
+   - Admin (`rate_limiter_admin`): **100 requests/minute**
+
+   The 11th request from a user within 60 seconds gets a 429.
+- **Bypassing the limit for admin:** The limiter is chosen per request from the JWT role (`04-api-gateway/production/app.py`):
+   ```python
+   limiter = rate_limiter_admin if role == "admin" else rate_limiter_user
+   ```
+   Logging in as an account with `role: "admin"` (for example `teacher`) gives a token that uses the 100 req/min limiter, which is 10× higher. The role comes from the signed JWT, so a user can't fake it. To remove the limit for admins completely, skip the check for that role:
+   ```python
+   if role != "admin":
+       rate_info = rate_limiter_user.check(username)
+   ```
+   Even so, keeping a high limit for admins is safer than none, because it still protects the service if an admin token leaks.
+
+- **Response when the rate limit is reached:** `429 Too Many Requests` `{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":32}}`
 
 ### Exercise 4.4: Cost guard implementation
-[Explain your approach]
+
+**How the provided `cost_guard.py` works**
+- Each user gets a `UsageRecord` that counts input and output tokens and requests for the current day. Cost is calculated from GPT-4o-mini prices ($0.15 per 1M input tokens, $0.60 per 1M output tokens).
+- `check_budget()` runs **before** the LLM call:
+  - If the **global** daily spend (all users) reaches $10, it returns **503**, which protects the whole bill.
+  - If the **user's** daily spend reaches $1, it returns **402 Payment Required**, with `used_usd`, `budget_usd` and `resets_at`.
+  - At 80% of the budget, it logs a warning.
+- `record_usage()` runs **after** the LLM call and adds the real token cost.
+- A new day automatically starts a fresh record, because `record.day != today`.
+- **Limitation:** everything is stored in an in-memory `dict`. A restart resets every budget, and each replica or worker keeps its own count, so with N instances a user could spend N× the budget. That's why the exercise asks to move the state to Redis.
+
+**My implementation: $10 per user per month, stored in Redis**
+
+```python
+import redis
+from datetime import datetime, timezone
+
+r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+MONTHLY_BUDGET_USD = 10.0
+
+# Atomic "check and reserve": runs entirely inside Redis, so two concurrent
+# requests can't both read the same old value and overspend together.
+_RESERVE_LUA = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local cost    = tonumber(ARGV[1])
+local budget  = tonumber(ARGV[2])
+if current + cost > budget then
+    return 0
+end
+redis.call('INCRBYFLOAT', KEYS[1], cost)
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+_reserve = r.register_script(_RESERVE_LUA)
+
+
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    """
+    Return True if the user still has budget (and reserve estimated_cost),
+    False if this request would exceed $10 for the current month.
+    """
+    month_key = datetime.now(timezone.utc).strftime("%Y-%m")   # e.g. 2026-11
+    key = f"budget:{user_id}:{month_key}"
+    ttl = 32 * 24 * 3600                                       # > 1 month → auto-cleanup
+    return bool(_reserve(keys=[key], args=[estimated_cost, MONTHLY_BUDGET_USD, ttl]))
+```
+
+Using it in `/ask`:
+```python
+if not check_budget(username, estimated_cost=0.001):
+    raise HTTPException(status_code=402, detail="Monthly budget exceeded")
+answer = ask(body.question)
+```
+
+**Design decisions**
+
+| Requirement | How it's handled |
+|-------------|------------------|
+| $10 per user per month | `MONTHLY_BUDGET_USD = 10.0`, compared against `current + estimated_cost`, so a request that **would** go over the budget is blocked before the LLM is called |
+| Track spending in Redis | One key per user per month, `budget:<user_id>:<YYYY-MM>`, incremented with `INCRBYFLOAT`. It's shared by every replica and worker and survives app restarts |
+| Reset at the start of the month | The month is part of the key. On the 1st (UTC), a new key `budget:alice:2026-12` starts at 0, so no cron job or manual reset is needed. `EXPIRE 32 days` deletes old keys automatically |
+| Concurrency | The reference solution does `GET`, compares, then `INCRBYFLOAT` as separate steps, so two parallel requests can both pass the check and overspend. The Lua script runs all three steps **atomically** inside Redis, which fixes that race |
+| UTC | `datetime.now(timezone.utc)`, so every instance switches month at the same moment regardless of server timezone |
+
+**Possible improvements**
+- Reserve an **estimated** cost first, then after the LLM call correct it with the real token cost (`INCRBYFLOAT key (actual - estimated)`), as `record_usage()` does.
+- Keep the **global** cap as well (`budget:global:<YYYY-MM>`) and return 503 when it's reached, so one bug or many users can't exceed the company-wide bill.
+- Warn at 80% (log or alert), as the original `warn_at_pct` does.
+- If Redis is down, **fail closed**: return 503 instead of letting the request through unbudgeted.
 
 ## Part 5: Scaling & Reliability
 
