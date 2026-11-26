@@ -276,3 +276,41 @@ Total messages: 10
   - Even so, all 5 requests used the **same session ID**, and the history endpoint (served by whichever instance received it) returned all **10 messages** (5 questions + 5 answers) in the correct order.
   - This shows no instance keeps the conversation in its own memory: each instance reads and writes the session in the shared Redis, so the agent is stateless and can be scaled up or down without losing user sessions.
 
+## Part 6: Final Project
+
+Run from WSL (Ubuntu, Python 3.12, Docker 29.9.3), full mode including the Docker build:
+```bash
+cd 06-lab-complete
+python check_production_ready.py
+```
+
+### Checklist Deliverable
+| # | Criterion | Result | Evidence from the checker |
+|---|-----------|--------|---------------------------|
+| 1 | Dockerfile (multi-stage, < 500 MB) | ✅ | 2 `FROM` stages, final stage `python:3.11-slim`, non-root user, `HEALTHCHECK`, image **273 MB**, container serves `GET /health` → 200 |
+| 2 | docker-compose.yml (agent + redis) | ✅ | Services `agent` (built from Dockerfile) and `redis` (`redis:7-alpine`); agent has `REDIS_URL=redis://redis:6379/0` and `depends_on: redis` |
+| 3 | .dockerignore | ✅ | Excludes `.env`, `__pycache__`, `venv` |
+| 4 | Health check endpoint (`GET /health`) | ✅ | 200 with `uvicorn --workers 2` |
+| 5 | Readiness endpoint (`GET /ready`) | ✅ | 200 when Redis is up; **503** when Redis is unreachable while `/health` stays 200 |
+| 6 | API Key authentication | ✅ | Missing or wrong `X-API-Key` → 401; correct key → 200 |
+| 7 | Rate limiting | ✅ | 429 after 5 successful requests (`RATE_LIMIT_PER_MINUTE=5`); still 429 after restarting the agent, so the state lives in Redis |
+| 8 | Cost guard | ✅ | Budget `0.000001` USD → 402 on the 1st request |
+| 9 | Config from environment variables | ✅ | `app/config.py` reads env vars, `.env.example` lists all variables, `.env` is git-ignored, no hard-coded secrets; the agent uses the random `AGENT_API_KEY` and `RATE_LIMIT_PER_MINUTE` passed by the checker |
+| 10 | Structured logging | ✅ | Every app log line is valid JSON (17 lines) |
+| 11 | Graceful shutdown | ✅ | SIGTERM during a request → the request still returns 200, process exits with code 0; `docker stop` → exit code 0 in **0.8 s** |
+| 12 | Public URL ready (Railway / Render config) | ✅ | `railway.toml` (`builder = "DOCKERFILE"`, `healthcheckPath = "/health"`) and `render.yaml` (`type: web`, `healthCheckPath: /health`, `AGENT_API_KEY` uses `generateValue`); CMD listens on `${PORT:-8000}` |
+
+**Result: 12/12 criteria · 43/43 checks passed — 🎉 PASS 12/12 — PRODUCTION READY!**
+
+### What each piece reuses from Parts 1–5
+| File | Built from |
+|------|------------|
+| `app/config.py` | Part 1: 12-factor config, every setting read from env vars with safe local defaults |
+| `app/logging_config.py` | Part 1: structured JSON logs; the request middleware logs method, path, status and latency, never headers or secrets |
+| `app/auth.py` | Part 4.1: `X-API-Key` header, compared with `secrets.compare_digest`, fails closed (401) if no key is configured |
+| `app/rate_limiter.py` | Part 4.3 + 5.3: the sliding-window log algorithm, moved from an in-memory `deque` to a Redis sorted set inside one atomic Lua script, so all workers share it and it survives restarts. Returns `Retry-After` |
+| `app/cost_guard.py` | Part 4.4: daily and monthly cost counters in Redis keyed by `YYYY-MM-DD` / `YYYY-MM` (automatic reset, `EXPIRE` cleans old keys). Checked before the LLM call (402), recorded after it, fails closed (503) if Redis is down |
+| `app/main.py` | Part 5.1 + 5.2: `/health` liveness (always 200), `/ready` readiness (503 when Redis is down or shutting down), `lifespan` cleanup and uvicorn's own SIGTERM handling for graceful shutdown |
+| `Dockerfile` | Part 2: multi-stage build with a venv copied into a slim runtime, non-root user, `HEALTHCHECK`, `exec uvicorn` so uvicorn is PID 1 and receives SIGTERM |
+| `docker-compose.yml` | Part 2.4 + 5.4: agent + Redis with a healthcheck, `depends_on: condition: service_healthy`, optional `.env` |
+
