@@ -109,13 +109,6 @@ Compose starts them in dependency order. `redis` and `qdrant` start first, and `
 - **agent → qdrant:** over HTTP REST at `QDRANT_URL=http://qdrant:6333`, used for vector search.
 - **Healthchecks:** Docker checks each service from inside its container: the agent with `GET http://localhost:8000/health`, redis with `redis-cli ping`, and qdrant with a TCP connect to port 6333. These results control startup order, and `restart: unless-stopped` restarts the agent or nginx if its process exits.
 
-
-## Part 3: Cloud Deployment
-
-### Exercise 3.1: Railway deployment
-- URL: https://your-app.railway.app
-- Screenshot: [Link to screenshot in repo]
-
 ## Part 4: API Security
 
 ### Exercise 4.1: API key authentication
@@ -220,5 +213,66 @@ answer = ask(body.question)
 
 ## Part 5: Scaling & Reliability
 
-### Exercise 5.1-5.5: Implementation notes
-[Your explanations and test results]
+### Exercise 5.1: Health check
+- Verify Liveness probe: `200 OK` `{"status":"ok","uptime_seconds":132.4,"version":"1.0.0","environment":"development","timestamp":"2026-11-26T15:07:03.831266+00:00","checks":{"memory":{"status":"ok","used_percent":5.1}}}`
+- Verify Readiness probe: `200 OK` `{"ready":true,"in_flight_requests":1}`
+
+### Exercise 5.2: Graceful shutdown
+- Command for sending SIGTERM: `kill -TERM $PID`
+
+- Server after receiving SIGTERM: 
+```
+INFO:     127.0.0.1:55440 - "POST /ask HTTP/1.1" 422 Unprocessable Entity
+INFO:     Waiting for application shutdown.
+2026-11-26 22:17:22,680 INFO 🔄 Graceful shutdown initiated...
+2026-11-26 22:17:22,680 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [3184]
+2026-11-26 22:17:22,681 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+- Request when calling SIGTERM immediately after calling the request: `422 Unprocessable Entity` `{"detail":[{"type":"missing","loc":["query","question"],"msg":"Field required","input":null}]}`
+
+###  Exercise 5.3: Stateless design
+**Why move state to Redis?** When the agent scales to several instances behind a load balancer, each request from the same user can go to a different instance. If session or conversation history is kept in an in-memory `dict`:
+- **State is split:** request 1 is saved in instance A's memory, request 2 goes to instance B, which has no record of the session, so the conversation context is lost.
+- **State is lost on restart:** every deploy, crash or scale-down wipes the memory of that instance, and its users' sessions with it.
+- **No safe scaling:** you can't add or remove instances freely, and you'd need sticky sessions, which spread load unevenly and still fail when an instance dies.
+
+Moving the state to Redis makes every agent instance **stateless**. Each request loads the session from Redis (`session:<id>`), updates it and saves it back, so any instance can serve any request. Redis is shared by all instances, survives app restarts, and `SETEX` gives each session a TTL so old sessions expire automatically.
+
+###  Exercise 5.4: Load balancing
+- Services after running:
+| Service | Instances | Status |
+|---|---|---|
+| Agent | 3 | Up (healthy) |
+| Redis | 1 | Up (healthy) |
+| Nginx | 1 | Up |
+- Observations: Nginx recive the request at port 8080 and evenly distributed to 3 agents.
+
+###  Exercise 5.5: Test stateless
+- Output of `python test_stateless.py` (3 agent replicas behind Nginx):
+```
+Session ID: f8143a1a-06d4-4036-9e6f-dd36cd70debe
+
+Request 1: [instance-408426]   Q: What is Docker?
+Request 2: [instance-7f2ef4]   Q: Why do we need containers?
+Request 3: [instance-6ad612]   Q: What is Kubernetes?
+Request 4: [instance-408426]   Q: How does load balancing work?
+Request 5: [instance-7f2ef4]   Q: What is Redis used for?
+
+Total requests: 5
+Instances used: {'instance-408426', 'instance-7f2ef4', 'instance-6ad612'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  ... (5 user + 5 assistant messages, in order)
+✅ Session history preserved across all instances via Redis!
+```
+- Observations:
+  - Nginx distributed the 5 requests **round-robin** across all 3 instances (408426 → 7f2ef4 → 6ad612 → 408426 → 7f2ef4), so consecutive requests of the same session were served by different instances.
+  - Even so, all 5 requests used the **same session ID**, and the history endpoint (served by whichever instance received it) returned all **10 messages** (5 questions + 5 answers) in the correct order.
+  - This shows no instance keeps the conversation in its own memory: each instance reads and writes the session in the shared Redis, so the agent is stateless and can be scaled up or down without losing user sessions.
+
