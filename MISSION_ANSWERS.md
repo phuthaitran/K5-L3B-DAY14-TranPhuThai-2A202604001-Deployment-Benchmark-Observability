@@ -109,6 +109,12 @@ Compose starts them in dependency order. `redis` and `qdrant` start first, and `
 - **agent → qdrant:** over HTTP REST at `QDRANT_URL=http://qdrant:6333`, used for vector search.
 - **Healthchecks:** Docker checks each service from inside its container: the agent with `GET http://localhost:8000/health`, redis with `redis-cli ping`, and qdrant with a TCP connect to port 6333. These results control startup order, and `restart: unless-stopped` restarts the agent or nginx if its process exits.
 
+## Part 3: Cloud Deployment
+- URL: https://production-ai-agent-n9zs.onrender.com/
+- Screenshots: 
+    - [Deployment dashboard](screenshots/dashboard.png)
+    - [Service running](screenshots/running.png)
+    - [Test results](screenshots/test.png)
 ## Part 4: API Security
 
 ### Exercise 4.1: API key authentication
